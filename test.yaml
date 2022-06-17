@@ -22,10 +22,46 @@ spec:
     spec:
       containers:
         - name : mindbox-app
-          image: nginx:latest
+          image: nginx:1.22.0 #используем последнюю стабильную версию для оптимизации деплоя согласно Guaranteed QoS
+#создаем правило размещение подов по разным зонам, повышеваем отказоустойчивость и доступность 
+          affinity:
+        podAntiAffinity:
+           requiredDuringSchedulingIgnoredDuringExecution:
+              - labelSelector:
+                  matchExpressions:
+                    - key: "app"
+                      operator: In
+                      values:
+                      - nginx
+                topologyKey: "kubernetes.io/hostname"
+    #взятие проб работоспособности при инициализации (проба каждый 5 сек, ожидание 5 сек перед каждой пробой)
+          livenessProbe:
+            httpGet:
+              path: /healthz
+              port: 80
+            initialDelaySeconds: 5
+            periodSeconds: 5
+    # устанавливаем лимиты на поды
+          resource:
+    #лимит потребления 0.1 CPU (для минимизирования потребления ресуросов) оптимальный requests 0.1 (согласно требованиям)
+    #limits = requests для Guaranteed QoS
+            limits:
+              cpu: "0.1"
+            requests:
+              cpu: "0.1"
+    #В момент старта значительно больше - 0.5 CPU
+            args:
+              - -cpus
+              - "0.5"
+    #Ресурсы памяти так же аналогичны (в условиях) 128 Мб
+          resource:
+            limits:
+              memory: 128Mi
+            requests:
+              memory: 128Mi
           ports:
             - containerPort: 80
-#Для установки ресурсных значений было принято решение использовать Horizontal Pod Autoscaling
+#Horizontal Pod Autoscaling для автоскейлинга подов
 ---
 apiVersion: autoscaling/v2
 kind: HorizontalPodAutoscaler
@@ -40,27 +76,58 @@ spec:
       apiVersion: apps/v2
       kind: Deployment
       name: my-web-deployment
-    minReplicas: 4
+    minReplicas: 1
     maxReplicas: 4
     metrics:
-    # устанавливаем лимиты на поды
-    - type: Resource
-      resource:
-    #лимит потребления 0.1 CPU (для минимизирования потребления ресуросов) оптимальный requests 0.1 (согласно требованиям)
-    #limits = requests для Guaranteed QoS
-        limits:
-          cpu: "0.1"
-        requests:
-          cpu: "0.1"
-    #В момент старта значительно больше - 0.5 CPU
-      args:
-      - -cpus
-      - "0.5"
-    #Ресурсы памяти так же аналогичны (в условиях) 128 Мб
-    - type: Resource
-      resource:
-        limits:
-          memory: 128Mi
-        requests:
-          memory: 128Mi
-
+      - type: Resource
+        resource:
+          name: cpu
+          target:
+            type: Utilization
+            averageUtilization: 80
+      - type: Resource
+        resource:
+          name: memory
+          target:
+            type: AverageValue
+            averageValue: 128Mi
+---
+#Для балансировки нагрузки днем\ночью используем CronJob (выполнение ругулярных запалнированных действий)
+#скейлинг в 11:00 3 пода
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-up
+spec:
+  schedule: "0 11 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: mindbox-app
+            image: nginx:1.22.0
+            args:
+            - /bin/bash
+            - -c
+            - kubectl scale --replicas=3 deployment/nginx
+          restartPolicy: OnFailure
+#скейлинг в 22:00 1 пода
+apiVersion: batch/v1
+kind: CronJob
+metadata:
+  name: scale-down
+spec:
+  schedule: "0 22 * * *"
+  jobTemplate:
+    spec:
+      template:
+        spec:
+          containers:
+          - name: mindbox-app
+            image: nginx:1.22.0
+            args:
+            - /bin/bash
+            - -c
+            - kubectl scale --replicas=1 deployment/nginx
+          restartPolicy: OnFailure
